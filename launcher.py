@@ -1,5 +1,4 @@
-import os, subprocess, time, threading, sys, socket
-import gradio as gr
+import os, subprocess, time, threading, sys, socket, re
 
 PORT = 8188
 
@@ -8,57 +7,56 @@ def is_port_in_use(port):
         return s.connect_ex(('127.0.0.1', port)) == 0
 
 def run_comfyui():
-    """守护 ComfyUI 进程并自动清理端口"""
-    print(f"[ComfyUI] 正在清理端口 {PORT}...")
+    """守护 ComfyUI 进程"""
+    print(f"[ComfyUI] 清理端口 {PORT}...")
     subprocess.run(["fuser", "-k", f"{PORT}/tcp"], check=False)
     
-    # 3090 优化参数
     cmd = [sys.executable, "main.py", "--listen", "127.0.0.1", "--port", str(PORT), "--highvram"]
-    
     while True:
-        print(f"\n[ComfyUI] 启动中...")
+        print(f"\n[ComfyUI] 启动核心服务...")
         process = subprocess.Popen(cmd)
         process.wait()
         print(f"\n[ComfyUI] 进程退出，5秒后重启...")
         time.sleep(5)
 
-def start_gradio_tunnel():
-    """
-    使用 Gradio 6.x 的标准 launch 模式建立隧道。
-    这种方式生成的链接在 API 调用上最为稳定。
-    """
-    print("[Launcher] 正在等待 ComfyUI 启动...")
+def start_cloudflare_tunnel():
+    """启动 Cloudflare Quick Tunnel"""
+    # 1. 下载 cloudflared 二进制文件
+    if not os.path.exists("./cloudflared"):
+        print("[Tunnel] 正在下载 cloudflared...")
+        url = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64"
+        subprocess.run(["wget", "-q", "-O", "cloudflared", url], check=True)
+        subprocess.run(["chmod", "+x", "cloudflared"], check=True)
+
+    # 2. 等待后端就绪
     while not is_port_in_use(PORT):
+        print(f"[Tunnel] 等待端口 {PORT} 激活...")
         time.sleep(2)
 
-    print("[Launcher] 后端已就绪，正在开启 Gradio 隧道 (无 iframe 模式)...")
+    # 3. 开启隧道并实时抓取 URL
+    print("[Tunnel] 正在建立 Cloudflare 隧道...")
+    cmd = ["./cloudflared", "tunnel", "--url", f"http://127.0.0.1:{PORT}", "--no-autoupdate"]
     
-    # 创建一个极简的转发逻辑
-    # 我们不添加任何 Blocks 内容，直接利用 Gradio 的代理能力
-    def dummy_fn():
-        return "ComfyUI Proxy Running"
-
-    with gr.Blocks() as demo:
-        gr.Markdown(f"### ComfyUI 3090 Instance Running on Port {PORT}")
-        # 这里不放置 iframe，仅作为隧道入口
-
-    # 关键参数：
-    # 1. share=True 开启隧道
-    # 2. _api_mode=True (如果库版本支持) 优化 API 响应
-    demo.launch(
-        share=True, 
-        server_name="127.0.0.1", 
-        server_port=7860, # Gradio 自身的端口
-        quiet=True
-    )
+    # 使用 Popen 以便实时读取日志输出中的 URL
+    proc = subprocess.Popen(cmd, stderr=subprocess.PIPE, text=True)
+    
+    for line in proc.stderr:
+        # Cloudflare 快速隧道的地址格式通常是 https://xxx.trycloudflare.com
+        match = re.search(r"https://[a-zA-Z0-9-]+\.trycloudflare\.com", line)
+        if match:
+            url = match.group(0)
+            print("\n" + "█"*60)
+            print(f"  Cloudflare 隧道已就绪！")
+            print(f"  公网访问地址: {url}")
+            print(f"  API 请求示例: {url}/object_info")
+            print("█"*60 + "\n")
+            break
 
 if __name__ == "__main__":
-    # 1. 启动后端线程
-    t = threading.Thread(target=run_comfyui, daemon=True)
-    t.start()
-    
-    # 2. 启动隧道（主线程）
+    # 启动后端线程
+    threading.Thread(target=run_comfyui, daemon=True).start()
+    # 启动隧道
     try:
-        start_gradio_tunnel()
+        start_cloudflare_tunnel()
     except KeyboardInterrupt:
         print("关闭中...")
