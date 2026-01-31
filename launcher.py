@@ -16,8 +16,9 @@ def kill_process_on_port(port):
     """
     print(f"[Launcher] 正在清理端口 {port}...")
     current_pid = os.getpid()
+    killed = False
     
-    # 方案 1: 用 lsof/fuser (如果有)
+    # 方案 1: 用 lsof (推荐，最可靠)
     try:
         result = subprocess.run(['lsof', '-i', f':{port}', '-t'], 
                               capture_output=True, text=True, timeout=3)
@@ -25,45 +26,43 @@ def kill_process_on_port(port):
             for pid_str in result.stdout.strip().split('\n'):
                 try:
                     pid = int(pid_str)
-                    if pid != current_pid:
+                    if pid != current_pid and pid > 1000:  # 避免杀系统进程
                         print(f"[Launcher] 杀死进程 {pid}")
                         os.kill(pid, signal.SIGKILL)
+                        killed = True
                 except (ValueError, ProcessLookupError):
                     pass
-            time.sleep(2)
-            return
+            if killed:
+                time.sleep(2)
+                return
     except (FileNotFoundError, subprocess.TimeoutExpired):
         pass
     
-    # 方案 2: 遍历 /proc (如果有)
-    if os.path.exists('/proc'):
-        try:
-            for pid in os.listdir('/proc'):
-                if not pid.isdigit():
-                    continue
-                try:
-                    pid_int = int(pid)
-                    if pid_int == current_pid:
-                        continue
-                    
-                    # 读取 net/tcp 找占用端口的进程
-                    with open(f'/proc/{pid}/net/tcp', 'r') as f:
-                        for line in f:
-                            parts = line.split()
-                            if len(parts) > 3:
-                                local_addr = parts[1]
-                                # 格式: IP:PORT (16进制)
-                                if ':' in local_addr:
-                                    hex_port = local_addr.split(':')[1]
-                                    if int(hex_port, 16) == port:
-                                        print(f"[Launcher] 杀死进程 {pid_int}")
-                                        os.kill(pid_int, signal.SIGKILL)
-                except (FileNotFoundError, PermissionError, ValueError):
-                    pass
-        except Exception as e:
-            print(f"[Launcher] /proc 扫描失败: {e}")
+    # 方案 2: 用 ss 命令
+    try:
+        result = subprocess.run(['ss', '-tlnp'], 
+                              capture_output=True, text=True, timeout=3)
+        if result.stdout:
+            for line in result.stdout.split('\n'):
+                if f':{port}' in line:
+                    # 提取 pid
+                    match = re.search(r'pid=(\d+)', line)
+                    if match:
+                        pid = int(match.group(1))
+                        if pid != current_pid and pid > 1000:
+                            print(f"[Launcher] 杀死进程 {pid}")
+                            try:
+                                os.kill(pid, signal.SIGKILL)
+                                killed = True
+                            except ProcessLookupError:
+                                pass
+            if killed:
+                time.sleep(2)
+                return
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
     
-    # 方案 3: 暴力杀死所有 python main.py
+    # 方案 3: 只杀 ComfyUI 相关进程 (保险方案)
     try:
         result = subprocess.run(['pgrep', '-f', 'python.*main.py'], 
                               capture_output=True, text=True, timeout=3)
@@ -71,16 +70,18 @@ def kill_process_on_port(port):
             for pid_str in result.stdout.strip().split('\n'):
                 try:
                     pid = int(pid_str)
-                    if pid != current_pid:
-                        print(f"[Launcher] 杀死 python main.py 进程 {pid}")
+                    if pid != current_pid and pid > 1000:
+                        print(f"[Launcher] 杀死 ComfyUI 进程 {pid}")
                         os.kill(pid, signal.SIGKILL)
+                        killed = True
                 except (ValueError, ProcessLookupError):
                     pass
-            time.sleep(2)
+            if killed:
+                time.sleep(2)
     except (FileNotFoundError, subprocess.TimeoutExpired):
         pass
     
-    time.sleep(2)
+    time.sleep(1)
 
 def is_port_in_use(port):
     """用 socket 检测端口是否开了"""
