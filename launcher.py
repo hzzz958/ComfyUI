@@ -12,65 +12,61 @@ PORT = 8188
 
 def kill_process_on_port(port):
     """
-    纯 Python 实现：查找并杀掉占用指定端口的残留进程。
-    这种方法不依赖 fuser, lsof 等外部工具，最稳健。
+    纯 Python 暴力清理方案：不依赖 fuser/lsof。
+    直接遍历 /proc 文件夹，寻找并杀死所有占用 8188 端口的 python 进程。
     """
     print(f"[Launcher] 正在深度清理端口 {port}...")
     current_pid = os.getpid()
     try:
-        # 遍历 Linux /proc 文件系统查找进程
-        pids = [pid for pid in os.listdir('/proc') if pid.isdigit()]
-        for pid in pids:
+        # 遍历 /proc 下的所有进程 ID
+        for pid in [p for p in os.listdir('/proc') if p.isdigit()]:
             try:
                 pid_int = int(pid)
                 if pid_int == current_pid:
                     continue
                 
-                # 读取进程的命令行参数
+                # 读取进程的命令行
                 with open(os.path.join('/proc', pid, 'cmdline'), 'r') as f:
-                    cmdline = f.read()
-                    # 如果进程涉及 python 和 main.py (ComfyUI 入口)，则清理
-                    if 'python' in cmdline and ('main.py' in cmdline or 'comfy' in cmdline.lower()):
-                        print(f"[Launcher] 发现残留 ComfyUI 进程 {pid_int}，强制杀掉...")
+                    cmdline = f.read().replace('\0', ' ')
+                    # 只要包含 python 且包含 main.py 或 port 8188，就干掉
+                    if 'python' in cmdline and ('main.py' in cmdline or str(port) in cmdline):
+                        print(f"[Launcher] 强行终止残留进程: {pid_int}")
                         os.kill(pid_int, signal.SIGKILL)
             except (FileNotFoundError, ProcessLookupError, PermissionError):
                 continue
-        time.sleep(2) # 等待系统回收端口
+        time.sleep(2) # 留给内核释放端口的时间
     except Exception as e:
-        print(f"[Launcher] 清理端口时跳过错误: {e}")
+        print(f"[Launcher] 清理端口过程跳过: {e}")
 
 def is_port_in_use(port):
-    """检测本地端口是否已激活"""
+    """用 socket 检测端口是否真的开了"""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(1)
         return s.connect_ex(('127.0.0.1', port)) == 0
 
 def run_comfyui():
-    """守护 ComfyUI 核心服务进程"""
-    # 启动前先确保端口是干净的
+    """守护主服务进程"""
+    # 彻底清理残留，解决 Address already in use
     kill_process_on_port(PORT)
     
-    # 构建启动命令 (针对 3090 优化)
-    cmd = [
-        sys.executable, "main.py", 
-        "--listen", "127.0.0.1", 
-        "--port", str(PORT), 
-        "--highvram"
-    ]
+    # 启动命令 (针对 3090 优化)
+    cmd = [sys.executable, "main.py", "--listen", "127.0.0.1", "--port", str(PORT), "--highvram"]
     
     while True:
-        print(f"\n[ComfyUI] 正在启动核心服务...")
-        # stdout=None 确保日志直接打印到终端，方便调试
+        print(f"\n[ComfyUI] 启动中...")
+        # 显式指定 cwd，确保路径正确
         process = subprocess.Popen(cmd, cwd=os.getcwd())
         process.wait()
         
-        print(f"\n[ComfyUI] 进程意外退出，正在清理并准备重启...")
+        print(f"\n[ComfyUI] 进程退出，准备重启...")
         kill_process_on_port(PORT)
         time.sleep(5)
 
 def start_cloudflare_tunnel():
-    """启动 Cloudflare Quick Tunnel 并提取公网 URL"""
-    # 1. 下载二进制文件 (如果不存在)
+    """启动 Cloudflare 快速隧道"""
     cf_path = "./cloudflared"
+    
+    # 1. 纯 Python 下载，不依赖 wget/curl
     if not os.path.exists(cf_path):
         print("[Tunnel] 正在静默下载 Cloudflare 穿透工具...")
         url = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64"
@@ -79,43 +75,40 @@ def start_cloudflare_tunnel():
             urllib.request.urlretrieve(url, cf_path)
             os.chmod(cf_path, 0o755)
         except Exception as e:
-            print(f"[Tunnel] 下载失败: {e}")
+            print(f"[Tunnel] 工具下载失败: {e}")
             return
 
-    # 2. 等待后端 ComfyUI 端口就绪
+    # 2. 轮询等待后端启动
     print(f"[Tunnel] 等待本地端口 {PORT} 激活...")
     while not is_port_in_use(PORT):
         time.sleep(2)
 
-    # 3. 开启隧道
-    print("[Tunnel] 正在连接 Cloudflare 全球网络...")
+    # 3. 开启隧道并抓取 URL
+    print("[Tunnel] 正在建立 Cloudflare 网络连接...")
     cmd = [cf_path, "tunnel", "--url", f"http://127.0.0.1:{PORT}", "--no-autoupdate"]
     
-    # 捕获 stderr，因为 cloudflared 的 URL 打印在错误流中
-    proc = subprocess.Popen(cmd, stderr=subprocess.PIPE, text=True)
+    # 隧道输出都在 stderr
+    proc = subprocess.Popen(cmd, stderr=subprocess.PIPE, text=True, bufsize=1)
     
     for line in proc.stderr:
-        # 寻找匹配 https://xxx.trycloudflare.com 的字符串
+        # 提取 trycloudflare 域名
         match = re.search(r"https://[a-zA-Z0-9-]+\.trycloudflare\.com", line)
         if match:
             url = match.group(0)
-            print("\n" + "█"*65)
-            print(f"  ComfyUI 公网 API 地址 (无 iframe / 透明转发):")
+            print("\n" + "█"*60)
+            print(f"  ComfyUI 公网 API 地址已就绪 (原生转发):")
             print(f"  {url}")
-            print(f"  测试 API: {url}/object_info")
-            print("█"*65 + "\n")
+            print("█"*60 + "\n")
             break
 
 if __name__ == "__main__":
-    # 1. 启动 ComfyUI 守护线程
-    t = threading.Thread(target=run_comfyui, daemon=True)
-    t.start()
+    # 1. 异步启动后端
+    threading.Thread(target=run_comfyui, daemon=True).start()
     
-    # 2. 启动 Cloudflare 隧道逻辑 (主线程维持)
+    # 2. 启动隧道并保持主进程
     try:
         start_cloudflare_tunnel()
-        # 保持主线程不退出
         while True:
             time.sleep(100)
     except KeyboardInterrupt:
-        print("\n[Launcher] 收到退出信号，正在关闭服务...")
+        print("\n[Launcher] 正在安全退出...")
